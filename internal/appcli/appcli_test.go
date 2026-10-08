@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/fluffynuts/plasma-settings-migrator/internal/bundle"
 )
 
 func TestHandleIgnoresTheProgramsOwnArguments(t *testing.T) {
@@ -172,6 +174,29 @@ func TestInstallIntoCopiesAndReplaces(t *testing.T) {
 	}
 	if info, err := os.Stat(dest); err != nil || info.Mode().Perm()&0o100 == 0 {
 		t.Errorf("installed binary isn't executable: %v %v", info, err)
+	}
+}
+
+func TestInstallIntoLeavesOutABundledBackup(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "tool")
+	zipPath := filepath.Join(dir, "b.zip")
+	os.WriteFile(exe, []byte("PROGRAM"), 0o755)
+	os.WriteFile(zipPath, []byte("ZIP"), 0o644)
+	bundled := filepath.Join(dir, "migrate-settings")
+	if err := bundle.Write(bundled, exe, zipPath); err != nil {
+		t.Fatal(err)
+	}
+	binDir := filepath.Join(dir, "bin")
+	if err := installInto(&bytes.Buffer{}, bundled, binDir); err != nil {
+		t.Fatal(err)
+	}
+	// installed under the program's own name, not the bundle's
+	if got, err := os.ReadFile(filepath.Join(binDir, AppName)); err != nil || string(got) != "PROGRAM" {
+		t.Errorf("installed %q (%v), want just the program", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(binDir, "migrate-settings")); err == nil {
+		t.Error("installed under the bundle's name")
 	}
 }
 

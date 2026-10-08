@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/fluffynuts/plasma-settings-migrator/internal/bundle"
 	"github.com/fluffynuts/plasma-settings-migrator/internal/components"
 )
 
@@ -60,5 +61,36 @@ func TestOpenRejectsOtherZips(t *testing.T) {
 	os.WriteFile(p, []byte("not a zip"), 0o644)
 	if _, err := Open(p); err == nil {
 		t.Error("accepted")
+	}
+}
+
+func TestOpenReadsTheZipInABundle(t *testing.T) {
+	dir := t.TempDir()
+	env := &components.Env{Home: dir}
+	zipPath := filepath.Join(dir, "b.zip")
+	frag := &components.Fragment{Keys: []components.KeyValue{{File: "kdeglobals", Group: "Icons", Key: "Theme", Value: "Theme"}}}
+	if err := Write(zipPath, env, Manifest{Hostname: "src"}, []Part{{Included{"theme", "icon-theme"}, frag}}); err != nil {
+		t.Fatal(err)
+	}
+	exe := filepath.Join(dir, "tool")
+	os.WriteFile(exe, []byte("PROGRAM"), 0o755)
+	bundlePath := filepath.Join(dir, "bundle")
+	if err := bundle.Write(bundlePath, exe, zipPath); err != nil {
+		t.Fatal(err)
+	}
+
+	b, err := Open(bundlePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if b.Manifest.Hostname != "src" || !b.Has("theme", "icon-theme") {
+		t.Errorf("manifest: %+v", b.Manifest)
+	}
+	if got, err := b.Fragment("theme", "icon-theme"); err != nil || got.Keys[0].Value != "Theme" {
+		t.Errorf("fragment: %+v %v", got, err)
+	}
+	if _, err := Open(exe); err == nil {
+		t.Error("accepted a program with no backup bundled into it")
 	}
 }

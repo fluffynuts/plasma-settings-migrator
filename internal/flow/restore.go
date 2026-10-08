@@ -71,6 +71,7 @@ func Restore(o RestoreOptions) error {
 	if err != nil {
 		return err
 	}
+	o.Env.ApplyNow = mode == "now"
 	session := o.Session
 	if session == nil {
 		session = noSession{}

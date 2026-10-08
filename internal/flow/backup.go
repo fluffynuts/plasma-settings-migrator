@@ -4,9 +4,12 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/fluffynuts/plasma-settings-migrator/internal/archive"
+	"github.com/fluffynuts/plasma-settings-migrator/internal/bundle"
 	"github.com/fluffynuts/plasma-settings-migrator/internal/components"
 	"github.com/fluffynuts/plasma-settings-migrator/internal/ui"
 )
@@ -18,10 +21,18 @@ type BackupOptions struct {
 	Out         io.Writer
 	ZipPath     string // asked for when empty
 	ToolVersion string
+	// Program is this program's file, which a bundle is made from. When
+	// empty, no bundle is offered.
+	Program string
+	// BundlePath, when set, is where to save a bundle (the program with the
+	// backup inside it) without asking; otherwise the user is asked
+	// whether they want one.
+	BundlePath string
 }
 
-// Backup asks what to include, and saves it as a zip. It returns the
-// zip's path, or "" if there was nothing to save.
+// Backup asks what to include, and saves it as a zip, then offers to make
+// a bundle of it. It returns the zip's path, or "" if there was nothing to
+// save.
 func Backup(o BackupOptions) (string, error) {
 	picks, err := choose(o.Prompt, "back up", func(*components.Category, *components.SubComponent) bool { return true })
 	if err != nil {
@@ -77,5 +88,48 @@ func Backup(o BackupOptions) (string, error) {
 		return "", err
 	}
 	say(o.Out, "Saved %d component(s) to %s", len(parts), zipPath)
+	if err := offerBundle(o, zipPath); err != nil {
+		return zipPath, err
+	}
 	return zipPath, nil
+}
+
+// offerBundle makes a bundle of the backup at zipPath: where o.BundlePath
+// says, else if the user wants one.
+func offerBundle(o BackupOptions, zipPath string) error {
+	dest := o.BundlePath
+	if dest == "" {
+		if o.Program == "" {
+			return nil
+		}
+		yes, err := o.Prompt.Confirm("Also save a bundle: one file holding this program and the backup, to run on the other machine?")
+		if err != nil || !yes {
+			return err
+		}
+		if dest, err = o.Prompt.Input("Save the bundle as:", BundleName(zipPath)); err != nil {
+			return err
+		}
+	}
+	if o.Program == "" {
+		return fmt.Errorf("can't make a bundle: this program's file wasn't found")
+	}
+	return MakeBundle(o.Out, dest, o.Program, zipPath)
+}
+
+// MakeBundle saves a bundle of program and the backup at zipPath as dest.
+func MakeBundle(out io.Writer, dest, program, zipPath string) error {
+	if err := bundle.Write(dest, program, zipPath); err != nil {
+		return fmt.Errorf("making the bundle: %w", err)
+	}
+	say(out, "Saved the bundle as %s: copy it to the other machine and run it there to restore.", dest)
+	return nil
+}
+
+// BundleName is the name a bundle of the zip at zipPath gets by default:
+// the zip's, without ".zip".
+func BundleName(zipPath string) string {
+	if name := strings.TrimSuffix(zipPath, filepath.Ext(zipPath)); name != zipPath && name != "" && !strings.HasSuffix(name, "/") {
+		return name
+	}
+	return zipPath + "-bundle"
 }

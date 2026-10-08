@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/fluffynuts/plasma-settings-migrator/internal/bundle"
 	"github.com/fluffynuts/plasma-settings-migrator/internal/components"
 )
 
@@ -150,34 +151,45 @@ func writeTree(zw *zip.Writer, env *components.Env, ref components.FileRef, writ
 // Backup is an opened backup zip.
 type Backup struct {
 	Manifest Manifest
-	zr       *zip.ReadCloser
+	zr       *zip.Reader
+	file     io.Closer
 }
 
-// Open reads a backup's manifest.
+// Open reads a backup's manifest. zipPath is a backup zip, or a bundle (see
+// package bundle) holding one.
 func Open(zipPath string) (*Backup, error) {
-	zr, err := zip.OpenReader(zipPath)
+	bf, err := bundle.Open(zipPath)
 	if err != nil {
 		return nil, err
 	}
-	b := &Backup{zr: zr}
+	data := bf.Zip
+	if data == nil {
+		data = bf.Program // not a bundle: the whole file, which should be a zip
+	}
+	zr, err := zip.NewReader(data, data.Size())
+	if err != nil {
+		bf.Close()
+		return nil, fmt.Errorf("%s isn't a backup zip, or a bundle holding one: %w", zipPath, err)
+	}
+	b := &Backup{zr: zr, file: bf}
 	if err := readJSON(zr, "manifest.json", &b.Manifest); err != nil {
-		zr.Close()
+		bf.Close()
 		return nil, fmt.Errorf("%s doesn't look like a plasma-settings-migrator backup: %w", zipPath, err)
 	}
 	if b.Manifest.FormatVersion > FormatVersion {
-		zr.Close()
+		bf.Close()
 		return nil, fmt.Errorf("%s was made by a newer version of this tool (format %d): upgrade it first", zipPath, b.Manifest.FormatVersion)
 	}
 	return b, nil
 }
 
 // Close releases the zip.
-func (b *Backup) Close() error { return b.zr.Close() }
+func (b *Backup) Close() error { return b.file.Close() }
 
 // Fragment reads a sub-component's fragment, checked to be safe to apply.
 func (b *Backup) Fragment(category, sub string) (*components.Fragment, error) {
 	var f components.Fragment
-	if err := readJSON(&b.zr.Reader, path.Join(category, sub, "fragment.json"), &f); err != nil {
+	if err := readJSON(b.zr, path.Join(category, sub, "fragment.json"), &f); err != nil {
 		return nil, err
 	}
 	if err := f.Validate(); err != nil {
@@ -187,7 +199,7 @@ func (b *Backup) Fragment(category, sub string) (*components.Fragment, error) {
 }
 
 // Files is the backup as a file system, for the files a fragment refers to.
-func (b *Backup) Files() fs.FS { return &b.zr.Reader }
+func (b *Backup) Files() fs.FS { return b.zr }
 
 // Has reports whether the backup holds the sub-component.
 func (b *Backup) Has(category, sub string) bool {

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/fluffynuts/plasma-settings-migrator/internal/archive"
 	"github.com/fluffynuts/plasma-settings-migrator/internal/components"
 	"github.com/fluffynuts/plasma-settings-migrator/internal/ui"
 )
@@ -59,6 +60,7 @@ func testEnv(t *testing.T) *components.Env {
 		PlasmaMajor: 6,
 		BackupDir:   filepath.Join(home, "backups"),
 		LookPath:    func(string) (string, error) { return "/bin/x", nil },
+		Run:         func(string, ...string) error { return nil }, // no real plasma-apply-* or dbus-send
 	}
 }
 
@@ -138,6 +140,65 @@ func TestBackupThenRestore(t *testing.T) {
 	}
 	if len(restore.options[0]) != 2 {
 		t.Errorf("offered categories: %+v", restore.options[0])
+	}
+}
+
+func TestBackupOffersABundleLast(t *testing.T) {
+	env := testEnv(t)
+	put(t, filepath.Join(env.ConfigHome, "kdeglobals"), "[Icons]\nTheme=Papirus\n")
+	dir := t.TempDir()
+	program := filepath.Join(dir, "tool")
+	put(t, program, "PROGRAM")
+	zipPath := filepath.Join(dir, "b.zip")
+	choices := []any{[]string{"theme"}, []string{"icon-theme"}}
+
+	// asked last; declining makes only the zip
+	p := &script{t: t, answers: append(append([]any{}, choices...), false)}
+	var out bytes.Buffer
+	if _, err := Backup(BackupOptions{Env: env, Prompt: p, Out: &out, ZipPath: zipPath, Program: program}); err != nil {
+		t.Fatalf("%v\n%s", err, out.String())
+	}
+	if last := p.asked[len(p.asked)-1]; !strings.Contains(last, "bundle") {
+		t.Errorf("last question %q isn't about a bundle", last)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 2 {
+		t.Errorf("declined bundle, but %d files", len(entries))
+	}
+
+	// accepting asks where, and saves it there
+	bundlePath := filepath.Join(dir, "bundle")
+	p = &script{t: t, answers: append(append([]any{}, choices...), true, bundlePath)}
+	if _, err := Backup(BackupOptions{Env: env, Prompt: p, Out: &out, ZipPath: zipPath, Program: program}); err != nil {
+		t.Fatalf("%v\n%s", err, out.String())
+	}
+	if b, err := archive.Open(bundlePath); err != nil {
+		t.Errorf("bundle: %v", err)
+	} else {
+		b.Close()
+	}
+
+	// a bundle path that's given isn't asked about
+	os.Remove(bundlePath)
+	p = &script{t: t, answers: choices}
+	if _, err := Backup(BackupOptions{Env: env, Prompt: p, Out: &out, ZipPath: zipPath, Program: program, BundlePath: bundlePath}); err != nil {
+		t.Fatalf("%v\n%s", err, out.String())
+	}
+	if _, err := os.Stat(bundlePath); err != nil {
+		t.Error(err)
+	}
+}
+
+func TestBundleName(t *testing.T) {
+	for in, want := range map[string]string{
+		"plasma-settings-pc-2026-10-08.zip": "plasma-settings-pc-2026-10-08",
+		"/tmp/b.zip":                        "/tmp/b",
+		"backup":                            "backup-bundle",
+		".zip":                              ".zip-bundle",
+		"dir/.zip":                          "dir/.zip-bundle",
+	} {
+		if got := BundleName(in); got != want {
+			t.Errorf("BundleName(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
 

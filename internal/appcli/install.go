@@ -6,20 +6,21 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/fluffynuts/plasma-settings-migrator/internal/bundle"
 )
 
 // Install copies the running executable into ~/.local/bin, creating that
 // folder if need be, then warns if the folder isn't on the PATH. An older
 // copy is replaced without asking, since installing and upgrading is what
 // this is for.
+//
+// Run from a bundle (a copy with a backup added to it, see package bundle),
+// only the program is installed, under its usual name.
 func Install(out io.Writer) error {
-	exe, err := os.Executable()
+	exe, err := bundle.Self()
 	if err != nil {
-		return fmt.Errorf("locating the running program: %w", err)
-	}
-	exe, err = filepath.EvalSymlinks(exe)
-	if err != nil {
-		return fmt.Errorf("resolving the running program's path: %w", err)
+		return err
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -30,7 +31,11 @@ func Install(out io.Writer) error {
 }
 
 func installInto(out io.Writer, exe, binDir string) error {
-	dest := filepath.Join(binDir, filepath.Base(exe))
+	name := filepath.Base(exe)
+	if bundle.Bundled(exe) {
+		name = AppName
+	}
+	dest := filepath.Join(binDir, name)
 	if src, err := os.Stat(exe); err == nil {
 		if dst, err := os.Stat(dest); err == nil && os.SameFile(src, dst) {
 			fmt.Fprintf(out, "%s is already installed at %s\n", AppName, dest)
@@ -70,8 +75,9 @@ func replaceFile(src, dest string) error {
 	return nil
 }
 
+// copyFile copies the program in src, leaving out any backup bundled into it.
 func copyFile(src, dest string) error {
-	in, err := os.Open(src)
+	in, err := bundle.Open(src)
 	if err != nil {
 		return err
 	}
@@ -80,7 +86,7 @@ func copyFile(src, dest string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := io.Copy(out, in); err != nil {
+	if _, err := io.Copy(out, in.Program); err != nil {
 		out.Close()
 		return err
 	}

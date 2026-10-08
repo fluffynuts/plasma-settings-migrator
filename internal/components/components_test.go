@@ -146,6 +146,184 @@ func TestThemeRoundTrip(t *testing.T) {
 	}
 }
 
+// ran records the programs an Env runs.
+func ran(env *Env) *[]string {
+	var cmds []string
+	env.LookPath = func(name string) (string, error) { return "/usr/bin/" + name, nil }
+	env.Run = func(name string, args ...string) error {
+		cmds = append(cmds, name+" "+strings.Join(args, " "))
+		return nil
+	}
+	return &cmds
+}
+
+func TestThemeReadsWhatTheGlobalThemeSet(t *testing.T) {
+	// Plasma writes a global theme's settings to kdedefaults: those the user
+	// didn't change are only there.
+	src := newTestEnv(t)
+	write(t, filepath.Join(src.ConfigHome, "kdeglobals"), "[Colors:Window]\nBackgroundNormal=49,54,59\n\n[Icons]\nTheme=Papirus\n")
+	write(t, filepath.Join(src.ConfigHome, "kdedefaults", "kdeglobals"),
+		"[General]\nColorScheme=BreezeDark\n\n[Icons]\nTheme=breeze-dark\n\n[KDE]\nLookAndFeelPackage=org.kde.breezedark.desktop\n")
+	write(t, filepath.Join(src.ConfigHome, "kdedefaults", "plasmarc"), "[Theme]\nname=breeze-dark\n")
+	for _, c := range []struct{ sub, group, key, want string }{
+		{"color-scheme", "General", "ColorScheme", "BreezeDark"},
+		{"color-scheme", "Colors:Window", "BackgroundNormal", "49,54,59"},
+		{"icon-theme", "Icons", "Theme", "Papirus"}, // the user's own wins
+		{"global-theme", "KDE", "LookAndFeelPackage", "org.kde.breezedark.desktop"},
+		{"plasma-style", "Theme", "name", "breeze-dark"},
+	} {
+		frag, err := Find("theme", c.sub).Collect(src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := valueOf(frag.Keys, c.group, c.key); got != c.want {
+			t.Errorf("%s: [%s] %s = %q, want %q", c.sub, c.group, c.key, got, c.want)
+		}
+	}
+}
+
+func TestColorSchemeNamedFromItsHash(t *testing.T) {
+	src := newTestEnv(t)
+	scheme := filepath.Join(src.DataDirs[0], "color-schemes", "BreezeDark.colors")
+	write(t, scheme, "[Colors:Window]\nBackgroundNormal=49,54,59\n")
+	write(t, filepath.Join(src.ConfigHome, "kdeglobals"),
+		"[Colors:Window]\nBackgroundNormal=49,54,59\n\n[General]\nColorSchemeHash="+fileSHA1(scheme)+"\n")
+	frag, _ := Find("theme", "color-scheme").Collect(src)
+	if got := valueOf(frag.Keys, "General", "ColorScheme"); got != "BreezeDark" {
+		t.Errorf("ColorScheme = %q", got)
+	}
+	if got := valueOf(frag.Keys, "General", "ColorSchemeHash"); got != "" {
+		t.Errorf("hash carried: %q", got)
+	}
+}
+
+func colorFragment(name string) *Fragment {
+	f := &Fragment{Keys: []KeyValue{
+		{File: "kdeglobals", Group: "Colors:Window", Key: "BackgroundNormal", Value: "49,54,59"},
+		{File: "kdeglobals", Group: "General", Key: "AccentColor", Value: "1,2,3"},
+		{File: "kdeglobals", Group: "General", Key: "ColorSchemeHash", Value: "from-the-source"},
+	}}
+	if name != "" {
+		f.Keys = append(f.Keys, KeyValue{File: "kdeglobals", Group: "General", Key: "ColorScheme", Value: name})
+	}
+	return f
+}
+
+func TestColorSchemeForNextLogin(t *testing.T) {
+	dst := newTestEnv(t)
+	cmds := ran(dst)
+	write(t, filepath.Join(dst.DataDirs[0], "color-schemes", "BreezeDark.colors"), "[Colors:Window]\n")
+	if _, err := Find("theme", "color-scheme").Apply(dst, colorFragment("BreezeDark"), nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := kconfig.ReadFile(filepath.Join(dst.ConfigHome, "kdeglobals"))
+	// an empty hash makes Plasma apply this machine's BreezeDark at login
+	for key, want := range map[string]string{"ColorScheme": "BreezeDark", "ColorSchemeHash": "", "AccentColor": "1,2,3"} {
+		if v, ok := got.Get("General", key); !ok || v != want {
+			t.Errorf("%s = %q (%v), want %q", key, v, ok, want)
+		}
+	}
+	if len(*cmds) != 0 {
+		t.Errorf("ran %v", *cmds)
+	}
+}
+
+func TestUnnamedColorsAreKeptAtLogin(t *testing.T) {
+	// No name, so the hash is made to match the scheme Plasma would apply
+	// over them, and it leaves them alone.
+	dst := newTestEnv(t)
+	light := filepath.Join(dst.DataDirs[0], "color-schemes", "BreezeLight.colors")
+	write(t, light, "[Colors:Window]\nBackgroundNormal=239,240,241\n")
+	if _, err := Find("theme", "color-scheme").Apply(dst, colorFragment(""), nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := kconfig.ReadFile(filepath.Join(dst.ConfigHome, "kdeglobals"))
+	if v, _ := got.Get("General", "ColorSchemeHash"); v != fileSHA1(light) {
+		t.Errorf("hash = %q", v)
+	}
+	if v, _ := got.Get("Colors:Window", "BackgroundNormal"); v != "49,54,59" {
+		t.Errorf("colours not written: %q", v)
+	}
+}
+
+func TestColorSchemeNowUsesPlasmasTool(t *testing.T) {
+	dst := newTestEnv(t)
+	dst.ApplyNow = true
+	cmds := ran(dst)
+	write(t, filepath.Join(dst.DataDirs[0], "color-schemes", "BreezeDark.colors"), "[Colors:Window]\n")
+	rep, err := Find("theme", "color-scheme").Apply(dst, colorFragment("BreezeDark"), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(*cmds) != 1 || (*cmds)[0] != "plasma-apply-colorscheme BreezeDark" {
+		t.Errorf("ran %v", *cmds)
+	}
+	// the name isn't written first, or the tool would think it already set
+	got, _ := kconfig.ReadFile(filepath.Join(dst.ConfigHome, "kdeglobals"))
+	if _, ok := got.Get("General", "ColorScheme"); ok {
+		t.Error("ColorScheme written before the tool ran")
+	}
+	if v, _ := got.Get("General", "AccentColor"); v != "1,2,3" {
+		t.Errorf("accent = %q", v)
+	}
+	if !strings.Contains(strings.Join(rep.Applied, "\n"), "running session") {
+		t.Errorf("report: %+v", rep)
+	}
+}
+
+func TestGlobalTheme(t *testing.T) {
+	frag := &Fragment{Keys: []KeyValue{{File: "kdeglobals", Group: "KDE", Key: "LookAndFeelPackage", Value: "org.kde.breezedark.desktop"}}}
+	sub := Find("theme", "global-theme")
+
+	missing := newTestEnv(t)
+	if rep, _ := sub.Apply(missing, frag, nil, nil); len(rep.Skipped) != 1 || !strings.Contains(rep.Skipped[0], "isn't installed") {
+		t.Errorf("not installed: %+v", rep)
+	}
+
+	login := newTestEnv(t)
+	cmds := ran(login)
+	write(t, filepath.Join(login.DataDirs[0], "plasma", "look-and-feel", "org.kde.breezedark.desktop", "metadata.json"), "{}")
+	if _, err := sub.Apply(login, frag, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(*cmds) != 0 || !strings.Contains(read(t, filepath.Join(login.ConfigHome, "kdeglobals")), "LookAndFeelPackage=org.kde.breezedark.desktop") {
+		t.Errorf("ran %v", *cmds)
+	}
+
+	now := newTestEnv(t)
+	now.ApplyNow = true
+	cmds = ran(now)
+	write(t, filepath.Join(now.DataDirs[0], "plasma", "look-and-feel", "org.kde.breezedark.desktop", "metadata.json"), "{}")
+	if _, err := sub.Apply(now, frag, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(*cmds) != 1 || (*cmds)[0] != "plasma-apply-lookandfeel --apply org.kde.breezedark.desktop" {
+		t.Errorf("ran %v", *cmds)
+	}
+}
+
+func TestIconsNowTellRunningApps(t *testing.T) {
+	src, dst := newTestEnv(t), newTestEnv(t)
+	write(t, filepath.Join(src.ConfigHome, "kdeglobals"), "[Icons]\nTheme=breeze-dark\n")
+	dst.ApplyNow = true
+	dst.CacheHome = filepath.Join(dst.Home, ".cache")
+	write(t, filepath.Join(dst.CacheHome, "icon-cache.kcache"), "old")
+	cmds := ran(dst)
+	sub := Find("theme", "icon-theme")
+	frag, _ := sub.Collect(src)
+	if _, err := sub.Apply(dst, frag, archiveOf(t, src, frag), nil); err != nil {
+		t.Fatal(err)
+	}
+	all := strings.Join(*cmds, "\n")
+	if !strings.Contains(all, "/KIconLoader org.kde.KIconLoader.iconChanged int32:0") ||
+		!strings.Contains(all, "/KGlobalSettings org.kde.KGlobalSettings.notifyChange int32:4 int32:0") {
+		t.Errorf("ran:\n%s", all)
+	}
+	if _, err := os.Stat(filepath.Join(dst.CacheHome, "icon-cache.kcache")); err == nil {
+		t.Error("icon cache kept")
+	}
+}
+
 func TestThemeCollectsNothingFromAnEmptyMachine(t *testing.T) {
 	env := newTestEnv(t)
 	for _, c := range Registry() {
@@ -259,7 +437,8 @@ func TestGlobalShortcutsApplyHonoursSelection(t *testing.T) {
 	}
 }
 
-func TestGlobalShortcutsApplyToPlasma5(t *testing.T) {
+// Plasma 5.27 keeps application shortcuts in [services] groups too.
+func TestGlobalShortcutsApplyToPlasma5UsesServices(t *testing.T) {
 	src := shortcutsEnv(t)
 	frag, _ := Find("hotkeys", "global-shortcuts").Collect(src)
 	dst := newTestEnv(t)
@@ -268,7 +447,90 @@ func TestGlobalShortcutsApplyToPlasma5(t *testing.T) {
 	if _, err := Find("hotkeys", "global-shortcuts").Apply(dst, frag, nil, Selection{"service/org.kde.dolphin.desktop/_launch": true}); err != nil {
 		t.Fatal(err)
 	}
-	if b := read(t, filepath.Join(dst.ConfigHome, "kglobalshortcutsrc")); b != "[org.kde.dolphin.desktop]\n_launch=Meta+E,none,Dolphin\n" {
+	if b := read(t, filepath.Join(dst.ConfigHome, "kglobalshortcutsrc")); b != "[services][org.kde.dolphin.desktop]\n_launch=Meta+E\n" {
+		t.Errorf("got:\n%s", b)
+	}
+}
+
+func TestUnboundIsUnboundWhetherNoneOrEmpty(t *testing.T) {
+	env := newTestEnv(t)
+	write(t, filepath.Join(env.ConfigHome, "kglobalshortcutsrc"),
+		"[kwin]\nSwitch to Desktop 5=none,,Switch to Desktop 5\nGrid View=none,Meta+G,Toggle Grid View\n")
+	frag, err := Find("hotkeys", "global-shortcuts").Collect(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(frag.Items) != 1 || frag.Items[0].ID != "kwin/Grid View" {
+		t.Errorf("items: %+v", frag.Items)
+	}
+}
+
+func TestShortcutsAtLoginWaitForTheLoginHook(t *testing.T) {
+	src := shortcutsEnv(t)
+	frag, _ := Find("hotkeys", "global-shortcuts").Collect(src)
+	dst := newTestEnv(t)
+	dst.ShortcutsAtLogin = true
+	before := "[kwin]\n_k_friendly_name=KWin\nShow Desktop=Meta+D,Meta+D,Show Desktop (target)\n"
+	write(t, filepath.Join(dst.ConfigHome, "kglobalshortcutsrc"), before)
+	write(t, filepath.Join(dst.DataHome, "applications", "org.kde.dolphin.desktop"), "[Desktop Entry]\nName=Dolphin\n")
+
+	sel := Selection{"kwin/Show Desktop": true, "service/org.kde.dolphin.desktop/_launch": true}
+	rep, err := Find("hotkeys", "global-shortcuts").Apply(dst, frag, nil, sel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := read(t, filepath.Join(dst.ConfigHome, "kglobalshortcutsrc")); got != before {
+		t.Errorf("written now:\n%s", got)
+	}
+	if !HasPendingShortcuts(dst) || len(rep.Applied) != 1 || !strings.Contains(rep.Applied[0], "next login") {
+		t.Fatalf("pending %v, report %+v", HasPendingShortcuts(dst), rep)
+	}
+
+	program := filepath.Join(t.TempDir(), "prog")
+	write(t, program, "PROGRAM")
+	if err := InstallLoginHook(dst, program); err != nil {
+		t.Fatal(err)
+	}
+	script := read(t, hookPath(dst))
+	copied := filepath.Join(PendingDir(dst), "plasma-settings-migrator")
+	if !strings.Contains(script, "'"+copied+"' apply-pending >>") || !strings.Contains(script, "rm -f '"+hookPath(dst)+"'") {
+		t.Errorf("hook script:\n%s", script)
+	}
+	if read(t, copied) != "PROGRAM" {
+		t.Error("program not copied")
+	}
+
+	// at login
+	rep, err = ApplyPendingShortcuts(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := kconfig.ReadFile(filepath.Join(dst.ConfigHome, "kglobalshortcutsrc"))
+	if v, _ := got.Get("kwin", "Show Desktop"); v != `Meta+D\tCtrl+F12,Meta+D,Show Desktop (target)` {
+		t.Errorf("Show Desktop = %q", v)
+	}
+	if v, _ := got.Get("services][org.kde.dolphin.desktop", "_launch"); v != "Meta+E" {
+		t.Errorf("dolphin = %q", v)
+	}
+	if len(rep.Applied) != 2 || !strings.Contains(rep.Applied[0], "Peek at Desktop") {
+		t.Errorf("report: %+v", rep)
+	}
+	for _, p := range []string{hookPath(dst), PendingDir(dst)} {
+		if _, err := os.Stat(p); err == nil {
+			t.Errorf("%s left behind", p)
+		}
+	}
+}
+
+func TestPendingShortcutsAddUp(t *testing.T) {
+	env := newTestEnv(t)
+	kv := func(key, value string) KeyValue {
+		return KeyValue{Item: key, File: "kglobalshortcutsrc", Group: "kwin", Key: key, Value: value}
+	}
+	deferShortcuts(env, &Fragment{Keys: []KeyValue{kv("a", "1,,A"), kv("b", "2,,B")}})
+	deferShortcuts(env, &Fragment{Keys: []KeyValue{kv("b", "3,,B")}})
+	ApplyPendingShortcuts(env)
+	if b := read(t, filepath.Join(env.ConfigHome, "kglobalshortcutsrc")); b != "[kwin]\na=1,,A\nb=3,,B\n" {
 		t.Errorf("got:\n%s", b)
 	}
 }
@@ -344,5 +606,19 @@ func TestValidateRejectsEscapes(t *testing.T) {
 	ok := Fragment{Files: []FileRef{{Root: "data", Path: "icons/x"}}, Keys: []KeyValue{{File: "kdeglobals", Group: "g", Key: "k"}}}
 	if err := ok.Validate(); err != nil {
 		t.Error(err)
+	}
+}
+
+func TestPlasmaVersionFromTheSessionFiles(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "a", "wayland-sessions", "gnome.desktop"),
+		"[Desktop Entry]\nExec=gnome-session\nX-KDE-PluginInfo-Version=46\n")
+	write(t, filepath.Join(dir, "b", "xsessions", "plasmax11.desktop"),
+		"[Desktop Entry]\nExec=/usr/lib/plasma-dbus-run-session-if-needed /usr/bin/startplasma-x11\nX-KDE-PluginInfo-Version=6.2.4\n")
+	if v := sessionFileVersion([]string{filepath.Join(dir, "a"), filepath.Join(dir, "b")}); v != "6.2.4" {
+		t.Errorf("version %q", v)
+	}
+	if v := sessionFileVersion([]string{filepath.Join(dir, "a")}); v != "" {
+		t.Errorf("took another desktop's version: %q", v)
 	}
 }

@@ -33,11 +33,11 @@ func hotkeysCategory() *Category {
 //   - A component such as kwin is a group of its own, each action being
 //     "active keys,default keys,friendly name" (keys tab-separated, commas
 //     in the text escaped), plus _k_friendly_name for the component.
-//   - Since Plasma 6, an application's .desktop file is the group
-//     [services][app.desktop], holding only what differs from the file's
-//     defaults: "_launch=keys", or an action's name and its keys.
-//   - Plasma 5 kept those as [app.desktop] with the triplets of
-//     a component. Plasma 6 migrates them on first run.
+//   - An application's .desktop file is the group [services][app.desktop]
+//     (Plasma 5.27 does this too), holding only what differs from the
+//     file's defaults: "_launch=keys", or an action's name and its keys.
+//   - Older Plasma 5 kept those as [app.desktop] with the triplets of a
+//     component; they are read, and migrated by Plasma on first run.
 //   - A "custom command" shortcut is a .desktop file flagged with
 //     X-KDE-GlobalAccel-CommandShortcut=true (in ~/.local/share/kglobalaccel
 //     when made by Plasma 6), bound as a service like any other.
@@ -49,6 +49,7 @@ type binding struct {
 	value   string // as in the file
 	keys    string // the active keys alone
 	def     string // the default keys; "" for service bindings
+	triplet bool   // whether the value is "active,default,name"
 	label   string // the action's friendly name, if the file has one
 	service string // the .desktop id, if it is a service binding
 	comp    string // the component's friendly name
@@ -102,7 +103,7 @@ func readBindings(env *Env) ([]binding, error) {
 				parts := splitUnescaped(e.Value, ',')
 				b.keys = parts[0]
 				if len(parts) == 3 {
-					b.def, b.label = parts[1], unescapeText(parts[2])
+					b.def, b.label, b.triplet = parts[1], unescapeText(parts[2]), true
 				}
 			}
 			out = append(out, b)
@@ -112,6 +113,17 @@ func readBindings(env *Env) ([]binding, error) {
 }
 
 func unescapeText(s string) string { return strings.ReplaceAll(s, `\,`, ",") }
+
+// sameKeys compares two shortcuts, "none" and "" both being none.
+func sameKeys(a, b string) bool {
+	norm := func(k string) string {
+		if k == "none" {
+			return ""
+		}
+		return k
+	}
+	return norm(a) == norm(b)
+}
 
 func displayKeys(keys string) string {
 	if keys == "" || keys == "none" {
@@ -176,11 +188,10 @@ func collectGlobalShortcuts(env *Env) (*Fragment, error) {
 			}
 			item = Item{ID: "service/" + b.service + "/" + b.key, Label: what + "  [" + displayKeys(b.keys) + "]", Group: "Applications"}
 			// A service binding in either format is carried in the
-			// current one, with just the keys; applying converts back
-			// for Plasma 5.
+			// current one, with just the keys.
 			kv.Group, kv.Value = servicesPrefix+b.service, b.keys
 		} else {
-			if b.def != "" && b.keys == b.def {
+			if b.triplet && sameKeys(b.keys, b.def) {
 				continue // not customised: the target has it already
 			}
 			label := b.label
@@ -200,16 +211,14 @@ func applyGlobalShortcuts(env *Env, f *Fragment, src fs.FS, sel Selection) (*Rep
 	return applyShortcutKeys(env, f, sel, nil)
 }
 
-// applyShortcutKeys writes the selected keys of f into kglobalshortcutsrc.
+// applyShortcutKeys writes the selected keys of f into kglobalshortcutsrc,
+// or keeps them for the next login when env.ShortcutsAtLogin says so.
 // Bindings of applications are only written for those installed here.
 // Items in allow, when given, are the only ones considered.
 func applyShortcutKeys(env *Env, f *Fragment, sel Selection, allow map[string]bool) (*Report, error) {
 	rep := &Report{}
-	labels := map[string]string{}
-	for _, it := range f.Items {
-		labels[it.ID] = it.Label
-	}
-	var kvs []KeyValue
+	labels := itemLabels(f)
+	todo := &Fragment{}
 	for _, kv := range f.Keys {
 		if !sel.Has(kv.Item) || (allow != nil && !allow[kv.Item]) {
 			continue
@@ -219,35 +228,28 @@ func applyShortcutKeys(env *Env, f *Fragment, sel Selection, allow map[string]bo
 				rep.skipped("%s: %s isn't installed", labelOr(labels, kv.Item, kv.Key), id)
 				continue
 			}
-			if !env.plasma6() {
-				kv.Group = id // Plasma 5 keeps these as components
-			}
 		}
-		kvs = append(kvs, kv)
+		todo.Keys = append(todo.Keys, kv)
 	}
-	written, _, err := writeKeys(env, kvs, func(kv KeyValue, existing *string) (string, string) {
-		isService := strings.HasSuffix(kv.Group, ".desktop")
-		triplet := !env.plasma6() || !isService
-		if !triplet {
-			return kv.Value, ""
-		}
-		// Triplet: only the active keys are ours to set; the default keys
-		// and friendly name belong to the machine the keys are going to.
-		keys := kv.Value
-		if parts := splitUnescaped(kv.Value, ','); len(parts) == 3 {
-			keys = parts[0]
-		}
-		if existing != nil {
-			if parts := splitUnescaped(*existing, ','); len(parts) == 3 {
-				return keys + "," + parts[1] + "," + parts[2], ""
+	if env.ShortcutsAtLogin {
+		for _, it := range f.Items {
+			for _, kv := range todo.Keys {
+				if kv.Item == it.ID {
+					todo.Items = append(todo.Items, it)
+					break
+				}
 			}
 		}
-		if strings.HasPrefix(kv.Value, keys+",") && len(splitUnescaped(kv.Value, ',')) == 3 {
-			return kv.Value, ""
+		if len(todo.Keys) == 0 {
+			return rep, nil
 		}
-		_, df := desktopFile(env, kv.Group)
-		return keys + ",none," + strings.ReplaceAll(appName(df, kv.Group), ",", `\,`), ""
-	})
+		if err := deferShortcuts(env, todo); err != nil {
+			return rep, err
+		}
+		rep.applied("%d shortcut(s), from your next login", len(todo.Keys))
+		return rep, nil
+	}
+	written, err := writeShortcuts(env, todo.Keys)
 	if err != nil {
 		return rep, err
 	}
@@ -255,6 +257,26 @@ func applyShortcutKeys(env *Env, f *Fragment, sel Selection, allow map[string]bo
 		rep.applied("%s", labelOr(labels, kv.Item, kv.Key))
 	}
 	return rep, nil
+}
+
+// writeShortcuts puts the settings into kglobalshortcutsrc. Of a component
+// action ("active,default,name"), only the active keys are taken: the
+// default keys and friendly name belong to the machine they are going to.
+func writeShortcuts(env *Env, kvs []KeyValue) ([]KeyValue, error) {
+	written, _, err := writeKeys(env, kvs, func(kv KeyValue, existing *string) (string, string) {
+		if strings.HasPrefix(kv.Group, servicesPrefix) {
+			return kv.Value, ""
+		}
+		parts := splitUnescaped(kv.Value, ',')
+		if len(parts) != 3 || existing == nil {
+			return kv.Value, ""
+		}
+		if old := splitUnescaped(*existing, ','); len(old) == 3 {
+			return parts[0] + "," + old[1] + "," + old[2], ""
+		}
+		return kv.Value, ""
+	})
+	return written, err
 }
 
 func labelOr(labels map[string]string, id, fallback string) string {

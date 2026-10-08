@@ -30,42 +30,70 @@ func matchGroup(pattern, name string) bool {
 	return pattern == name
 }
 
+// kdedefaultsDir is where Plasma writes the settings of the global theme
+// (~/.config/kdedefaults/kdeglobals, ...), under the user's own files: a
+// value the user hasn't changed from the theme's is only found there.
+const kdedefaultsDir = "kdedefaults"
+
 // collectKeys reads what the specs describe from the files in the config
-// folder. A file that isn't there simply yields nothing.
+// folder, falling back to kdedefaults for what the user's files don't
+// set. A file that isn't there simply yields nothing.
 func collectKeys(env *Env, item string, specs ...KeySpec) ([]KeyValue, error) {
 	var out []KeyValue
 	files := map[string]*kconfig.File{}
-	for _, spec := range specs {
-		f, loaded := files[spec.File]
+	load := func(name string) (*kconfig.File, error) {
+		f, loaded := files[name]
 		if !loaded {
 			var err error
-			f, err = kconfig.ReadFile(filepath.Join(env.ConfigHome, spec.File))
+			f, err = kconfig.ReadFile(filepath.Join(env.ConfigHome, name))
 			if err != nil && !os.IsNotExist(err) {
 				return nil, err
 			}
-			files[spec.File] = f
+			files[name] = f
 		}
-		if f == nil {
-			continue
-		}
-		for _, g := range f.Groups() {
-			if !matchGroup(spec.Group, g.Name) {
+		return f, nil
+	}
+	for _, spec := range specs {
+		for _, name := range []string{spec.File, path.Join(kdedefaultsDir, spec.File)} {
+			f, err := load(name)
+			if err != nil {
+				return nil, err
+			}
+			if f == nil {
 				continue
 			}
-			for _, e := range g.Pairs() {
-				if len(spec.Keys) > 0 && !contains(spec.Keys, e.Key) {
+			for _, g := range f.Groups() {
+				if !matchGroup(spec.Group, g.Name) {
 					continue
 				}
-				// A repeated key means the last counts, and Group.Get gives that.
-				v, _ := g.Get(e.Key)
-				kv := KeyValue{Item: item, File: spec.File, Group: g.Name, Key: e.Key, Value: v}
-				if !hasKV(out, kv) {
-					out = append(out, kv)
+				for _, e := range g.Pairs() {
+					if len(spec.Keys) > 0 && !contains(spec.Keys, e.Key) {
+						continue
+					}
+					// A repeated key means the last counts, and Group.Get gives that.
+					v, _ := g.Get(e.Key)
+					kv := KeyValue{Item: item, File: spec.File, Group: g.Name, Key: e.Key, Value: v}
+					if !hasKV(out, kv) {
+						out = append(out, kv)
+					}
 				}
 			}
 		}
 	}
 	return out, nil
+}
+
+// effective is a setting as Plasma sees it: the user's file, else
+// kdedefaults, else def.
+func effective(env *Env, file, group, key, def string) string {
+	for _, name := range []string{file, path.Join(kdedefaultsDir, file)} {
+		if f, err := kconfig.ReadFile(filepath.Join(env.ConfigHome, name)); err == nil {
+			if v, ok := f.Get(group, key); ok {
+				return v
+			}
+		}
+	}
+	return def
 }
 
 func hasKV(list []KeyValue, kv KeyValue) bool {
